@@ -1,5 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
+use std::boxed::Box;
 use std::collections::HashSet;
 use syn::{parse_macro_input, DeriveInput};
 
@@ -38,7 +39,8 @@ fn try_extract_inner_ty(syn_ty: &syn::Type) -> Option<&syn::Type> {
             syn::PathArguments::None => Some(syn_ty),
             syn::PathArguments::AngleBracketed(ref inner_ty) => {
                 if let syn::GenericArgument::Type(first_ty) = inner_ty.args.first()? {
-                    Some(first_ty)
+                    // recurise on this
+                    try_extract_inner_ty(first_ty)
                 } else {
                     None
                 }
@@ -49,6 +51,20 @@ fn try_extract_inner_ty(syn_ty: &syn::Type) -> Option<&syn::Type> {
     None
 }
 
+// return key value pair of an attribute
+// #[debug(bond = "xxx")]
+fn parse_outter_attr(attrs: &syn::Attribute) -> Option<(syn::Ident, syn::LitStr)> {
+    assert!(attrs.path().is_ident("debug"));
+    attrs
+        .parse_args_with(|stream: syn::parse::ParseStream| {
+            let key: syn::Ident = stream.parse()?;
+            let _: syn::Token![=] = stream.parse()?;
+            let value: syn::LitStr = stream.parse()?;
+            Ok((key, value))
+        })
+        .ok()
+}
+
 #[proc_macro_derive(CustomDebug, attributes(debug))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -56,11 +72,20 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
     let struct_name_str = struct_name.to_string();
     let mut has_phantom = false;
-    let mut tys_to_bound: Vec<syn::TypePath> = vec![];
+    let mut tys_to_bound: HashSet<syn::TypePath> = HashSet::new();
 
     let generics = &input.generics;
     let has_generic = generics.type_params().next().is_some();
     let generic_ident = extract_first_generic(generics).unwrap_or(String::from(""));
+
+    // try inspect outter attr
+    let outter_attrs = input.attrs;
+    let trait_bound_quick_path = if outter_attrs.len() > 0 {
+        assert_eq!(outter_attrs.len(), 1);
+        parse_outter_attr(&outter_attrs[0])
+    } else {
+        None
+    };
 
     let debug_fields = if let syn::Data::Struct(st) = input.data {
         st.fields.into_iter().map(|f| {
@@ -74,8 +99,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
                             if has_generic
                                 && path_to_ident_set(&ty_path.path).contains(&generic_ident)
                             {
-                                tys_to_bound.push(ty_path.clone())
-                                
+                                tys_to_bound.insert(ty_path.clone());
                             }
                         }
                     });
@@ -125,24 +149,34 @@ pub fn derive(input: TokenStream) -> TokenStream {
     };
 
     let ret_stream = if has_generic {
-        let (_, ty_generics, _) = generics.split_for_impl();
-        let debug_bound_generics = if !has_phantom {
+        let (impl_generics, ty_generics, _) = generics.split_for_impl();
+        if !tys_to_bound.is_empty() {
             // find actual type to bound
-            let bounded_generic_tys = tys_to_bound.iter().map(|ty| {
-                eprintln!("{:#?}", ty);
-                quote! { #ty: std::fmt::Debug }
-            });
+            let bounded_generic_tys: Box<dyn Iterator<Item = proc_macro2::TokenStream>> =
+                if let Some((config_key, config_trait_bound)) = trait_bound_quick_path {
+                    assert_eq!(&config_key.to_string(), "bound");
+                    let config_trait_bound =
+                        syn::parse_str::<syn::WherePredicate>(&config_trait_bound.value())
+                            .expect("can not parse it as TypeParam");
+                    Box::new(std::iter::once(quote! {#config_trait_bound}))
+                } else {
+                    Box::new(tys_to_bound.iter().map(|ty| {
+                        quote! { #ty: std::fmt::Debug }
+                    }))
+                };
             quote! {
-                #(#bounded_generic_tys),*
+                impl #impl_generics std::fmt::Debug for #struct_name #ty_generics
+                where #(#bounded_generic_tys),*
+                {
+                    #fmt_fn_impl
+                }
             }
         } else {
-            let pure_generics = generics.type_params();
-            quote! {#(#pure_generics)*}
-        };
-        quote! {
-
-            impl <#debug_bound_generics> std::fmt::Debug for #struct_name #ty_generics{
-                #fmt_fn_impl
+            quote! {
+                impl #impl_generics std::fmt::Debug for #struct_name #ty_generics
+                {
+                    #fmt_fn_impl
+                }
             }
         }
     } else {
