@@ -10,6 +10,11 @@
 //
 // From the perspective of a user of this crate, they get all the necessary APIs
 // (macro, trait, struct) through the one bitfield crate.
-pub use bitfield_impl::bitfield;
-
+pub use bitfield_impl::{bitfield, specify_bits};
 // TODO other things
+
+pub trait Specifier {
+    const BITS: usize;
+}
+
+specify_bits!(0..=64);
