@@ -13,71 +13,38 @@ fn build_accessors(ts: &syn::ItemStruct) -> proc_macro2::TokenStream {
         fields
             .iter()
             .scan(quote! {0}, |offset, f| {
+                // get this done in the easiest way, bit level ops
                 let ty = &f.ty;
-                let getter_ident = format_ident!("get_{}", f.ident.as_ref().unwrap());
-                let setter_ident = format_ident!("set_{}", f.ident.as_ref().unwrap());
+                let ident = f.ident.as_ref().unwrap();
                 let prev_offset = offset.clone();
-                *offset  = quote! {#offset + <#ty as Specifier>::BITS};
-
-                Some(quote! {
-                pub fn #getter_ident(&self) -> u64 {
-                    let s_byte: usize = (#prev_offset) / 8;
-                    let e_byte: usize = (#offset + 7) / 8;
-                    let head_bits: usize = 8 - ((#prev_offset) % 8);
-                    let tail_bits: usize = (#offset) % 8;
-
-                    let mut val: u64 = 0;
-                    let full_byte_range = if tail_bits != 0 {
-                        val = (self.data[e_byte-1] >> (8 - tail_bits)) as u64;
-                        s_byte+1..e_byte-1
-                    }else {
-                        s_byte+1..e_byte
-                    };
-
-                    for (i, byte_idx) in full_byte_range.rev().enumerate() {
-                        val = val | (self.data[byte_idx] as u64) << (8 * (i+1));
+                *offset = quote! {#offset + <#ty as Specifier>::BITS};
+                let bit_index_range = quote! {(#prev_offset)..(#offset)};
+                let getter_method = {
+                    let ident = format_ident!("get_{}", ident);
+                    quote! {
+                        pub fn #ident(&self) -> u64 {
+                            let mut val = 0u64;
+                            for i in #bit_index_range {
+                                val <<= 1;
+                                val |= self.fetch_bit(i);
+                            }
+                            val
+                        }
                     }
-                    if e_byte - s_byte > 1 {
-                        // handle first byte
-                        let first_part = self.data[s_byte] & Self::mask(head_bits) as u8;
-                        val = val | (first_part as u64) << (<#ty as Specifier>::BITS - head_bits);
+                };
+                let setter_method = {
+                    let ident = format_ident!("set_{}", ident);
+                    quote! {
+                        pub fn #ident(&mut self, mut val: u64) {
+                            for i in (#bit_index_range).rev() {
+                                self.set_bit(i, (val & 0x1) as u8);
+                                val >>= 1;
+                            }
+                        }
                     }
-                    val
-                }
-            
-                pub fn #setter_ident(&mut self, mut val: u64) {
-                    let s_byte: usize = (#prev_offset) / 8;
-                    let e_byte: usize = (#offset + 7) / 8;
-                    let head_bits: usize = 8 - ((#prev_offset) % 8);
-                    let tail_bits: usize = (#offset) % 8;
+                };
 
-                    let full_byte_range = if tail_bits != 0 {
-                        // consume remainder part                        
-                        let last_part = val & Self::mask(tail_bits);
-                        Self::clear_and_set(&mut self.data[e_byte-1], last_part as u8, tail_bits);
-                        val >>= tail_bits;
-                        s_byte+1..e_byte-1
-                    }else {
-                        s_byte..e_byte
-                    };
-
-
-                    // store val onto data in reverse order
-                    val >>= tail_bits;
-
-                    for i in full_byte_range.rev() {
-                        Self::clear_and_set(&mut self.data[i], val as u8, 0);
-                        val >>= 8;
-                    }
-
-                    if e_byte - s_byte > 1{
-                        self.data[s_byte] &= !(Self::mask(head_bits) as u8);
-                        self.data[s_byte] |= val as u8;
-                    }
-                }
-            
-            })
-
+                Some(quote! {#getter_method #setter_method})
             })
             .collect()
     } else {
@@ -131,19 +98,24 @@ pub fn bitfield(_: TokenStream, input: TokenStream) -> TokenStream {
                 Self {data: [0; 4]}
             }
 
-            const fn mask(num_bits: usize) -> u64 {
-                (1 << num_bits) - 1
+            fn fetch_bit(&self, bit_index: usize) -> u64 {
+                let byte_index: usize = bit_index / 8;
+                let offset: usize = 7 - (bit_index % 8);
+                assert!(byte_index < self.data.len());
+                ((self.data[byte_index] >> offset) & 0x1) as u64
             }
 
-            fn clear_and_set(dst: &mut u8, src: u8, offset: usize) {
-                *dst = *dst & (Self::mask(offset) as u8);
-                *dst = *dst | (src << offset);
+            fn set_bit(&mut self, bit_index: usize, bit_val: u8) {
+                let byte_index: usize = bit_index / 8;
+                let offset: usize = 7 - (bit_index % 8);
+                assert!(byte_index < self.data.len());
+                self.data[byte_index] &= !(1 << offset);
+                self.data[byte_index] |= (bit_val << offset);
             }
 
             pub fn display(&self) {
-                for i in self.data{
-                    println!("{:#08b}", i);
-                }
+                let str_repr = self.data.map(|i| format!("{:08b}", i)).as_slice().join(" | ");
+                println!("{}", str_repr);
             }
 
             #accessors
