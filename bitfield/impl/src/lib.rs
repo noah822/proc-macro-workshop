@@ -104,12 +104,49 @@ fn get_total_bit_width(ts: &syn::ItemStruct) -> proc_macro2::TokenStream {
 
 fn sanity_check(ts: &syn::ItemStruct) -> proc_macro2::TokenStream {
     let bit_width = get_total_bit_width(&ts);
+    let bit_tag_check = if let syn::Fields::Named(syn::FieldsNamed {
+        named: ref fields, ..
+    }) = ts.fields
+    {
+        fields.iter().filter_map(|f| {
+            if f.attrs.len() > 0 {
+                assert_eq!(f.attrs.len(), 1);
+                let bit_tag = &f.attrs[0];
+                let ty = &f.ty;
+                assert!(bit_tag.path().is_ident("bits"));
+                if let syn::Meta::NameValue(syn::MetaNameValue { ref value, .. }) = bit_tag.meta {
+                    let tagged_width = syn_expr_to_usize(&value).unwrap();
+                    let check = quote! {
+                        if #tagged_width != (<#ty as Specifier>::BITS as usize) {
+                            panic!("tagged bit does not align with the underlying bit width");
+                        }
+                    };
+                    return Some(check);
+                } else {
+                    unreachable!("invalid inner `bitfield` tag format")
+                }
+            }
+            None
+        })
+    } else {
+        unreachable!()
+    };
+
     quote! {
         const _: () = {
             if (#bit_width) % 8 != 0 {panic!("sum of bit width is not divisive by 8");}
         };
+        const _: () = {
+            #(#bit_tag_check)*
+        };
     }
 }
+
+
+
+/// blanket impl for inner #[bit = xxx] attribute
+// #[proc_macro_attribute]
+// pub fn bits(_: TokenStream, input: TokenStream) -> TokenStream {input}
 
 #[proc_macro_attribute]
 pub fn bitfield(_: TokenStream, input: TokenStream) -> TokenStream {
@@ -121,6 +158,7 @@ pub fn bitfield(_: TokenStream, input: TokenStream) -> TokenStream {
 
     // check sanity of the bitfield struct
     // 1. sum of bit width
+    // 2. bit annotation aligns with the actual bit width constant in Specifier
     let checker = sanity_check(&annot_struct);
     BitfieldVisit.visit_item_struct_mut(&mut annot_struct);
 
@@ -181,6 +219,7 @@ fn find_best_fit_ty(num_bit: usize) -> syn::Ident {
     };
     syn::Ident::new(&format!("u{}", type_suffix), proc_macro2::Span::call_site())
 }
+
 
 #[proc_macro]
 pub fn specify_bits(ts: TokenStream) -> TokenStream {
