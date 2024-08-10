@@ -3,6 +3,9 @@ use quote::{format_ident, quote};
 use syn::visit_mut::VisitMut;
 use syn::{parse_macro_input, parse_quote};
 
+mod specifier;
+
+static WIDTH_PTYPE: [usize; 5] = [8, 16, 32, 64, 128];
 struct BitfieldVisit;
 
 fn build_accessors(ts: &syn::ItemStruct) -> proc_macro2::TokenStream {
@@ -22,20 +25,22 @@ fn build_accessors(ts: &syn::ItemStruct) -> proc_macro2::TokenStream {
                 let getter_method = {
                     let ident = format_ident!("get_{}", ident);
                     quote! {
-                        pub fn #ident(&self) -> u64 {
+                        pub fn #ident(&self) -> <#ty as Specifier>::Target{
                             let mut val = 0u64;
                             for i in #bit_index_range {
                                 val <<= 1;
                                 val |= self.fetch_bit(i);
                             }
-                            val
+                            let repr = val as <#ty as Specifier>::Container;
+                            <#ty as Specifier>::from_bit_repr(repr)
                         }
                     }
                 };
                 let setter_method = {
                     let ident = format_ident!("set_{}", ident);
                     quote! {
-                        pub fn #ident(&mut self, mut val: u64) {
+                        pub fn #ident(&mut self, val: <#ty as Specifier>::Target) {
+                            let mut val = <#ty as Specifier>::from_target(val);
                             for i in (#bit_index_range).rev() {
                                 self.set_bit(i, (val & 0x1) as u8);
                                 val >>= 1;
@@ -83,19 +88,48 @@ impl VisitMut for BitfieldVisit {
     }
 }
 
+fn get_total_bit_width(ts: &syn::ItemStruct) -> proc_macro2::TokenStream {
+    if let syn::Fields::Named(syn::FieldsNamed {
+        named: ref fields, ..
+    }) = ts.fields
+    {
+        fields.iter().fold(quote! {0}, |acc, f| {
+            let ty = &f.ty;
+            quote! {#acc + <#ty as Specifier>::BITS}
+        })
+    } else {
+        unreachable!()
+    }
+}
+
+fn sanity_check(ts: &syn::ItemStruct) -> proc_macro2::TokenStream {
+    let bit_width = get_total_bit_width(&ts);
+    quote! {
+        const _: () = {
+            if (#bit_width) % 8 != 0 {panic!("sum of bit width is not divisive by 8");}
+        };
+    }
+}
+
 #[proc_macro_attribute]
 pub fn bitfield(_: TokenStream, input: TokenStream) -> TokenStream {
     let mut annot_struct = parse_macro_input!(input as syn::ItemStruct);
     let struct_name = &annot_struct.ident.clone();
+
     let accessors = build_accessors(&annot_struct);
+    let bit_width = get_total_bit_width(&annot_struct);
+
+    // check sanity of the bitfield struct
+    // 1. sum of bit width
+    let checker = sanity_check(&annot_struct);
     BitfieldVisit.visit_item_struct_mut(&mut annot_struct);
 
     quote! {
+        #checker
         #annot_struct
-
         impl #struct_name{
             pub fn new() -> Self {
-                Self {data: [0; 4]}
+                Self {data: [0; (#bit_width)/8]}
             }
 
             fn fetch_bit(&self, bit_index: usize) -> u64 {
@@ -136,6 +170,18 @@ fn syn_expr_to_usize(input: &syn::Expr) -> Option<usize> {
     }
 }
 
+fn find_best_fit_ty(num_bit: usize) -> syn::Ident {
+    let type_suffix = {
+        let idx = WIDTH_PTYPE
+            .as_slice()
+            .iter()
+            .position(|width| *width >= num_bit)
+            .unwrap();
+        WIDTH_PTYPE[idx]
+    };
+    syn::Ident::new(&format!("u{}", type_suffix), proc_macro2::Span::call_site())
+}
+
 #[proc_macro]
 pub fn specify_bits(ts: TokenStream) -> TokenStream {
     let bit_range = parse_macro_input!(ts as syn::ExprRange);
@@ -154,10 +200,21 @@ pub fn specify_bits(ts: TokenStream) -> TokenStream {
     };
     let trait_impl = bit_range.map(|i| {
         let ident = syn::Ident::new(&format!("{}{}", "B", i), proc_macro2::Span::call_site());
+        let container_ty = find_best_fit_ty(i);
         quote! {
             pub enum #ident {}
             impl Specifier for #ident {
                 const BITS: usize = #i;
+                type Container = #container_ty;
+                type Target = #container_ty;
+
+                fn from_bit_repr(repr: Self::Container) -> Self::Target {
+                    repr as Self::Target
+                }
+
+                fn from_target(target: Self::Target) -> Self::Container {
+                    target as Self::Container
+                }
             }
         }
     });
@@ -165,4 +222,10 @@ pub fn specify_bits(ts: TokenStream) -> TokenStream {
         #(#trait_impl)*
     }
     .into()
+}
+
+/// BitfieldSpecifier
+#[proc_macro_derive(BitfieldSpecifier)]
+pub fn enum_specifier(ts: TokenStream) -> TokenStream {
+    specifier::enum_specifier(ts)
 }

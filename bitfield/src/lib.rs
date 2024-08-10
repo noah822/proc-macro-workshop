@@ -10,11 +10,38 @@
 //
 // From the perspective of a user of this crate, they get all the necessary APIs
 // (macro, trait, struct) through the one bitfield crate.
-pub use bitfield_impl::{bitfield, specify_bits};
-// TODO other things
+
+#[allow(unused_imports)]
+pub use bitfield_impl::{bitfield, BitfieldSpecifier};
 
 pub trait Specifier {
     const BITS: usize;
+    // minimal rust primitive type that contains the internal bit repr
+    type Container;
+    // target type the contain wants to coerse to 
+    type Target;
+
+    fn from_bit_repr(repr: Self::Container) -> Self::Target;
+    fn from_target(target: Self::Target) -> Self::Container;
 }
 
-specify_bits!(0..=64);
+bitfield_impl::specify_bits!(0..=64);
+
+/// blanket impl for some rust primitives
+impl Specifier for bool {
+    const BITS: usize = 1;
+    type Container = u8;
+    type Target = bool;
+    
+    fn from_bit_repr(repr: Self::Container) -> Self::Target {
+        match repr {
+            0 => false,
+            1 => true,
+            _ => unreachable!("invalid internal repr for `bool`")
+        }
+    }
+
+    fn from_target(target: Self::Target) -> Self::Container {
+        if target {1} else {0}
+    }
+}
